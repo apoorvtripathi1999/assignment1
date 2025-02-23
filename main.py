@@ -1,24 +1,87 @@
 from datetime import datetime
 
-from flask import Flask, render_template, request, redirect, url_for, send_file, send_from_directory, flash
+from flask import Flask, render_template, request, redirect, url_for, send_file, send_from_directory
 from werkzeug.utils import secure_filename
-from google.cloud import speech,texttospeech 
-project_id = 'lofty-fragment-448721-a0'
+
+import os
+
 from google.cloud import speech
 from google.protobuf import wrappers_pb2
 from google.cloud import texttospeech_v1
+from google.cloud import language_v1
 
 
-import os
+tts_client = texttospeech_v1.TextToSpeechClient()
+sr_client=speech.SpeechClient()
 
 app = Flask(__name__)
 
 # Configure upload folder
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'wav','txt'}
+ALLOWED_EXTENSIONS = {'wav'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def sample_recognize(content):
+  audio=speech.RecognitionAudio(content=content)
+
+  config=speech.RecognitionConfig(
+  # encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+  # sample_rate_hertz=24000,
+  language_code="en-US",
+  model="latest_long",
+  audio_channel_count=1,
+  enable_word_confidence=True,
+  enable_word_time_offsets=True,
+  )
+
+  operation=sr_client.long_running_recognize(config=config, audio=audio)
+
+  response=operation.result(timeout=90)
+
+  txt = ''
+  for result in response.results:
+    txt = txt + result.alternatives[0].transcript + '\n'
+
+  return txt
+
+
+def analyze_sentiment(text):
+    client = language_v1.LanguageServiceClient()
+    
+    document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
+    sentiment = client.analyze_sentiment(request={'document': document}).document_sentiment
+
+    return sentiment.score, sentiment.magnitude
+
+
+def sample_synthesize_speech(text=None, ssml=None):
+    input = texttospeech_v1.SynthesisInput()
+    if ssml:
+      input.ssml = ssml
+    else:
+      input.text = text
+
+    voice = texttospeech_v1.VoiceSelectionParams()
+    voice.language_code = "en-UK"
+    # voice.ssml_gender = "MALE"
+
+    audio_config = texttospeech_v1.AudioConfig()
+    audio_config.audio_encoding = "LINEAR16"
+
+    request = texttospeech_v1.SynthesizeSpeechRequest(
+        input=input,
+        voice=voice,
+        audio_config=audio_config,
+    )
+
+    response = tts_client.synthesize_speech(request=request)
+
+    return response.audio_content
+
+
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -38,28 +101,6 @@ def index():
     files = get_files()
     return render_template('index.html', files=files)
 
-client=speech.SpeechClient()
-
-def sample_recognize(content):
-  audio=speech.RecognitionAudio(content=content)
-  config=speech.RecognitionConfig(
-  language_code="en-US",
-  model="latest_long",
-  audio_channel_count=1,
-  enable_word_confidence=True,
-  enable_word_time_offsets=True,
-  )
-
-  operation=client.long_running_recognize(config=config, audio=audio)
-
-  response=operation.result(timeout=90)
-
-  txt = ''
-  for result in response.results:
-    txt = txt + result.alternatives[0].transcript + '\n'
-
-  return txt
-
 @app.route('/upload', methods=['POST'])
 def upload_audio():
     if 'audio_data' not in request.files:
@@ -70,68 +111,79 @@ def upload_audio():
         flash('No selected file')
         return redirect(request.url)
     if file:
-        filename_audio = datetime.now().strftime("%Y%m%d-%I%M%S%p") + '.wav'
-        filename_text = datetime.now().strftime("%Y%m%d-%I%M%S%p") + '.txt'
-        file_path_audio = os.path.join(app.config['UPLOAD_FOLDER'], filename_audio)
-        file_path_text = os.path.join(app.config['UPLOAD_FOLDER'], filename_text)
-        file.save(file_path_audio)
-        f = open(file_path_audio,'rb')
+        # filename = secure_filename(file.filename)
+        filename = datetime.now().strftime("%Y%m%d-%I%M%S%p") + '.wav'
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        filename = file_path
+        f = open(file_path,'rb')
         data = f.read()
         f.close()
+        
         text = sample_recognize(data)
+        
+
         print(text)
-        f = open(file_path_text,'w')
-        f.write(text)
-        f.close()
-    return redirect('/')
+
+        sentiment_score, sentiment_magnitude = analyze_sentiment(text)
+        
+        sentiment_score = round(sentiment_score, 2)
+        if sentiment_score > 0.75:
+            sentiment = "Positive"
+        if sentiment_score < - 0.75:
+            sentiment = "Negative"
+        else:
+            sentiment = "Neutral"
+
+
+        sentiment_text = f"\nSentiment: {sentiment}\nSentiment Magnitude: {sentiment_magnitude}"
+
+
+        with open(filename + '.txt', 'w') as f:
+          f.write(text)
+          f.write(sentiment_text)
+          f.close()
+
+    return redirect('/') #success
 
 @app.route('/upload/<filename>')
 def get_file(filename):
     return send_file(filename)
 
-def sample_synthesize_speech(text=None, ssml=None):
-    client = texttospeech_v1.TextToSpeechClient()
-    input = texttospeech_v1.SynthesisInput()
-    if ssml:
-      input.ssml = ssml
-    else:
-      input.text = text
-
-    voice = texttospeech_v1.VoiceSelectionParams()
-    voice.language_code = "en-UK"
-
-    audio_config = texttospeech_v1.AudioConfig()
-    audio_config.audio_encoding = "LINEAR16"
-
-    request = texttospeech_v1.SynthesizeSpeechRequest(
-        input=input,
-        voice=voice,
-        audio_config=audio_config,
-    )
-
-    response = client.synthesize_speech(request=request)
-
-    return response.audio_content
     
 @app.route('/upload_text', methods=['POST'])
 def upload_text():
     text = request.form['text']
     print(text)
-    
-    
+
+    filename = 'tts'+datetime.now().strftime("%Y%m%d-%I%M%S%p") + '.wav'
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
     wav = sample_synthesize_speech(text)
+    
     # save audio
-    base_filename = datetime.now().strftime("%Y%m%d-%I%M%S%p")
-    audio_file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{base_filename}.wav")
-    text_file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{base_filename}.txt")
-    f = open(audio_file_path,'wb')
+    f = open(file_path,'wb')
     f.write(wav)
     f.close()
+
+    sentiment_score, sentiment_magnitude = analyze_sentiment(text)
+
+    sentiment_score = round(sentiment_score, 2)
+    if sentiment_score > 0.75:
+        sentiment = "Positive"
+    if sentiment_score < - 0.75:
+        sentiment = "Negative"
+    else:
+        sentiment = "Neutral"
+
+    sentiment_text = f"\nSentiment: {sentiment}\nSentiment Magnitude: {f"{sentiment_magnitude:.2f}"}"
     
     #save text
-    f = open(text_file_path,'w')
-    f.write(text)
-    f.close()
+    with open(file_path + '.txt', 'w') as f:
+       f.write(text)
+       f.write(sentiment_text)
+       f.close()
 
     return redirect('/') #success
 
